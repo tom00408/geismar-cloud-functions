@@ -1,0 +1,287 @@
+rules_version = '2';
+
+// MTV Geismar – Firestore Security Rules
+// Zugriffsmodell:
+//  - Öffentliche Formulare/Shop (KEIN Login) dürfen ausschließlich NEUE
+//    Datensätze anlegen (create), niemals lesen/ändern/löschen.
+//  - Vorstand/Admin = feste Konten-Allowlist (isDashboardAdmin). Nur diese
+//    dürfen personenbezogene Daten lesen und verwalten. Ein reines
+//    "eingeloggt" reicht NICHT mehr, weil über das Social-Media-Tool
+//    weitere Auth-Konten (Team-Beauftragte) existieren.
+//  - Social-Media-Tool: eigene Collections mit Rollen aus socialMediaUsers
+//    (admin/vorstand sehen alles, team nur eigene Mannschaften).
+//  - Alles nicht ausdrücklich Erlaubte ist verboten (default deny am Ende).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // ===== Dashboard-Konten & Modul-Freischaltung =====
+    // Konten liegen in dashboardUsers/{uid}:
+    // { email, name, rolle, module[], rechte{modul: bereiche[]}, teams[], alleTeams, pins[] }.
+    // Angelegt/gelöscht wird nur über Cloud Functions (Admin SDK).
+    // Merksatz: eine Sperre, die nur eine Kachel versteckt, ist im
+    // Netzwerk-Tab keine — deshalb prüfen die Rules jedes Modul selbst.
+
+    function dashProfil() {
+      return get(/databases/$(database)/documents/dashboardUsers/$(request.auth.uid)).data;
+    }
+    function istDashboardKonto() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/dashboardUsers/$(request.auth.uid));
+    }
+    // Bootstrap-Allowlist bleibt, damit sich der Vorstand nie aussperren
+    // kann; zusätzlich zählt rolle 'admin' im eigenen Profil.
+    function isDashboardAdmin() {
+      return isSignedIn()
+        && (
+          request.auth.token.email in [
+            'handball@mtvgeismar.de',
+            'geschaeftsstelle@mtvgeismar.de'
+          ]
+          || (istDashboardKonto() && dashProfil().get('rolle', '') == 'admin')
+        );
+    }
+    // Modul frei = Admin ODER Modul-Schlüssel im eigenen Profil.
+    function hatModul(m) {
+      return isDashboardAdmin()
+        || (istDashboardKonto() && m in dashProfil().get('module', []));
+    }
+    // Bereich eines Moduls (z. B. shop/analytics). Fehlt rechte[m], gilt das
+    // ganze Modul — so behalten Bestandskonten alles. Muss zu bereichFrei()
+    // in dashboard/src/service/dashboardProfile.ts passen.
+    function rechtFrei(m, bereich) {
+      return isDashboardAdmin()
+        || (istDashboardKonto()
+            && m in dashProfil().get('module', [])
+            && (!(m in dashProfil().get('rechte', {}))
+                || bereich in dashProfil().get('rechte', {})[m]));
+    }
+    // Teams für Social Media, Spiele und Bus. Fehlt alleTeams, gelten alle.
+    function dashAlleTeams() {
+      return isDashboardAdmin()
+        || (istDashboardKonto() && dashProfil().get('alleTeams', true) == true);
+    }
+    function teamFrei(teamId) {
+      return dashAlleTeams()
+        || (istDashboardKonto() && teamId in dashProfil().get('teams', []));
+    }
+
+    // Profile: Admin verwaltet alle (Rolle/Module ändern); jedes Konto darf
+    // sein eigenes Profil lesen und AUSSCHLIESSLICH seine Pins ändern.
+    // create mit nur-pins erlaubt Legacy-Admins ohne Profil das Anheften.
+    match /dashboardUsers/{uid} {
+      allow read: if isDashboardAdmin() || (isSignedIn() && request.auth.uid == uid);
+      allow create: if isDashboardAdmin()
+        || (isSignedIn() && request.auth.uid == uid
+            && request.resource.data.keys().hasOnly(['pins']));
+      allow update: if isDashboardAdmin()
+        || (isSignedIn() && request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pins']));
+      allow delete: if isDashboardAdmin();
+    }
+
+    // Monitoring: Fehler legt die Cloud Function logClientError an (Admin-SDK,
+    // umgeht Rules). Lesen/gelesen-markieren nur Dashboard-Admin (Admin-App).
+    match /monitoringErrors/{errorId} {
+      allow read, update, delete: if isDashboardAdmin();
+    }
+
+    // --- Personenbezogene Eingänge: nur anlegen, Verwaltung nur Vorstand ---
+    // Shop-Analytics rechnet aus den Bestellungen, darf sie also lesen,
+    // aber nicht ändern.
+    match /bestellungen/{document} {
+      allow create: if true;                 // Shop-Bestellung ohne Login
+      allow read: if rechtFrei('shop', 'bestellungen') || rechtFrei('shop', 'analytics');
+      allow update, delete: if rechtFrei('shop', 'bestellungen');
+    }
+
+    match /widerrufe/{document} {
+      allow create: if true;                 // Widerrufsformular ohne Login
+      allow read, update, delete: if rechtFrei('shop', 'widerrufe');
+    }
+
+    match /mitgliedsantraege/{document} {
+      allow create: if true;                 // Mitgliedsantrag ohne Login
+      allow read, update, delete: if rechtFrei('mitglieder', 'antraege');
+    }
+
+    match /foevAntraege/{document} {
+      allow create: if true;                 // Fördervereinsantrag ohne Login
+      allow read, update, delete: if rechtFrei('mitglieder', 'foev');
+    }
+
+    // --- Bestellnummern-Zähler ---
+    // Der Shop erhöht die Nummer ohne Login. Anlegen/Erhöhen erlaubt,
+    // aber kein Löschen. (Sauberer wäre serverseitiges Hochzählen.)
+    match /counters/{document} {
+      allow read, create, update: if true;
+      allow delete: if false;
+    }
+
+    // --- Öffentlicher Lesekatalog, Pflege nur Vorstand ---
+    match /products/{document} {
+      allow read: if true;
+      allow write: if rechtFrei('shop', 'produkte');
+    }
+
+    match /rundschauen/{document} {
+      allow read: if true;
+      allow write: if hatModul('rundschau');
+    }
+
+    // --- Interne Einstellungen: nur Vorstand ---
+    match /settings/{document} {
+      allow read: if istDashboardKonto() || isDashboardAdmin();
+      allow write: if isDashboardAdmin();
+    }
+
+    // ================= Social-Media-Tool =================
+
+    function smProfile() {
+      return get(/databases/$(database)/documents/socialMediaUsers/$(request.auth.uid)).data;
+    }
+    function isSmUser() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/socialMediaUsers/$(request.auth.uid));
+    }
+    // Leitung = SM-Rolle admin/vorstand ODER Dashboard-Konto mit Social-Modul
+    // und allen Teams. Team-beschränkte Konten sind keine Leitung.
+    function isSmLeitung() {
+      return (hatModul('social') && dashAlleTeams())
+        || (isSmUser() && smProfile().role in ['admin', 'vorstand']);
+    }
+
+    // Spielbetriebs-Daten (Spiele, Vereine, Hallen) brauchen auch die
+    // eigenständigen Module „Spiele" und „Bus-Management"
+    function hatSpielzugriff() {
+      return isSmUser() || hatModul('social') || hatModul('spiele') || hatModul('bus');
+    }
+
+    // Nutzerprofile: eigenes Profil lesen, verwalten nur Leitung
+    match /socialMediaUsers/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isSmLeitung());
+      allow write: if isSmLeitung();
+    }
+
+    // Mannschaften: lesen alle SM-Nutzer, schreiben Leitung
+    match /socialMediaTeams/{teamId} {
+      allow read: if hatSpielzugriff();
+      allow write: if isSmLeitung();
+    }
+
+    // Instagram-Accounts: lesen alle SM-Nutzer (für Post-Zuordnung), schreiben Leitung
+    match /socialMediaAccounts/{accountId} {
+      allow read: if isSmUser() || hatModul('social');
+      allow write: if isSmLeitung();
+    }
+
+    // Design-Vorlagen (Render-Engine): lesen alle SM-Nutzer, pflegen Leitung
+    match /socialMediaTemplates/{templateId} {
+      allow read: if isSmUser() || hatModul('social');
+      allow write: if (isSmLeitung() && (rechtFrei('social', 'vorlagen') || rechtFrei('social', 'editor')))
+        || (isSmUser() && smProfile().role in ['admin', 'vorstand']);
+    }
+
+    // Hinterlegte Logo-Varianten des eigenen Vereins (MTV Geismar) —
+    // gepflegt in den Dashboard-Einstellungen, auswählbar am Heimverein
+    match /socialMediaVereinsLogos/{logoId} {
+      allow read: if isSmUser() || hatModul('social');
+      allow write: if isSmLeitung();
+    }
+
+    // Hallen-Grafiken (Bus/IGS 1/IGS 2) und Spielfoto-Pool fürs Autofill —
+    // gepflegt in den Dashboard-Einstellungen
+    match /socialMediaHallenGrafiken/{grafikId} {
+      allow read: if isSmUser() || hatModul('social');
+      allow write: if isSmLeitung();
+    }
+
+    // Spielerfotos (Foto-Bibliothek im Editor): Team-Nutzer pflegen die
+    // Fotos ihrer Mannschaften selbst
+    match /socialMediaSpielfotos/{fotoId} {
+      allow read: if isSmUser() || hatModul('social');
+      allow create: if isSmLeitung()
+        || (hatModul('social') && teamFrei(request.resource.data.teamId));
+      allow update, delete: if isSmLeitung()
+        || (hatModul('social') && teamFrei(resource.data.teamId));
+    }
+
+    // Hallen (Name + Adresse, aus nuLiga-Import oder manuell) und
+    // Vereins-Fahrzeuge (Bus-Management)
+    match /socialMediaHallen/{halleId} {
+      allow read, write: if hatSpielzugriff();
+    }
+
+    // Live-Status laufender Spielplan-Importe (Function schreibt per Admin
+    // SDK, Client liest nur mit)
+    match /socialMediaImportStatus/{importId} {
+      allow read: if isSmUser() || hatModul('social');
+      allow write: if false;
+    }
+
+    match /socialMediaFahrzeuge/{fahrzeugId} {
+      allow read: if hatSpielzugriff();
+      allow write: if isSmLeitung() || hatModul('bus');
+    }
+
+    // Gegner-Vereine (Name + Logo, teamübergreifend wiederverwendbar)
+    match /socialMediaOpponents/{opponentId} {
+      allow read: if hatSpielzugriff();
+      allow write: if isSmUser() || hatModul('social') || rechtFrei('spiele', 'gegner')
+        || rechtFrei('spiele', 'spiele') || hatModul('bus');
+    }
+
+    // Spielplan: Leitung alles; Team-Rolle nur Spiele der eigenen Mannschaften
+    // Dashboard-Konten: Spiele/Bus/Social nur für freigegebene Teams.
+    match /socialMediaMatches/{matchId} {
+      allow read: if isSmLeitung()
+        || ((hatModul('spiele') || hatModul('bus') || hatModul('social'))
+            && teamFrei(resource.data.teamId))
+        || (isSmUser() && resource.data.teamId in smProfile().teams);
+      allow delete: if isSmLeitung()
+        || ((rechtFrei('spiele', 'spiele') || hatModul('bus') || hatModul('social'))
+            && teamFrei(resource.data.teamId))
+        || (isSmUser() && resource.data.teamId in smProfile().teams);
+      allow create: if isSmLeitung()
+        || ((rechtFrei('spiele', 'spiele') || hatModul('social'))
+            && teamFrei(request.resource.data.teamId))
+        || (isSmUser() && request.resource.data.teamId in smProfile().teams);
+      allow update: if isSmLeitung()
+        || ((rechtFrei('spiele', 'spiele') || hatModul('bus') || hatModul('social'))
+            && teamFrei(resource.data.teamId)
+            && teamFrei(request.resource.data.teamId))
+        || (isSmUser()
+            && resource.data.teamId in smProfile().teams
+            && request.resource.data.teamId in smProfile().teams);
+    }
+
+    // Posts: Leitung alles; Team-Rolle nur Posts der eigenen Mannschaften
+    match /socialMediaPosts/{postId} {
+      allow read, delete: if isSmLeitung()
+        || (hatModul('social') && teamFrei(resource.data.teamId))
+        || (isSmUser() && resource.data.teamId in smProfile().teams);
+      allow create: if isSmLeitung()
+        || (hatModul('social') && teamFrei(request.resource.data.teamId))
+        || (isSmUser() && request.resource.data.teamId in smProfile().teams);
+      allow update: if isSmLeitung()
+        || (hatModul('social')
+            && teamFrei(resource.data.teamId)
+            && teamFrei(request.resource.data.teamId))
+        || (isSmUser()
+            && resource.data.teamId in smProfile().teams
+            && request.resource.data.teamId in smProfile().teams);
+    }
+
+    // Instagram-Tokens (instagramVerbindungen) liest/schreibt nur die
+    // Cloud Function per Admin SDK — für Clients greift die Sperre unten.
+
+    // --- Alles andere verboten ---
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

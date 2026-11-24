@@ -1,0 +1,53 @@
+rules_version = '2';
+
+// MTV Geismar – Storage Security Rules
+// Öffentlich lesbar sind nur die bewusst öffentlichen Bild-/PDF-Ordner.
+// Schreiben nur eingeloggt (Vorstand/Admin). Alles andere verboten.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Öffentliche Vereinszeitung (Archiv + Vorschaubilder)
+    match /rundschau/{file=**} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+    match /rundschauPreview/{file=**} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // Produktbilder des Shops
+    match /product-images/{file=**} {
+      allow read: if true;
+      allow write: if isSignedIn()
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Social-Media-Post-Bilder (nur eingeloggt, auch lesen)
+    match /socialMedia/{file=**} {
+      allow read, delete: if isSignedIn();
+      allow create, update: if isSignedIn()
+                   && request.resource.size < 10 * 1024 * 1024
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Alt-Bestand Produktbilder (vor Umstellung auf product-images/):
+    // bestehende products-Dokumente referenzieren noch images/… —
+    // öffentlich lesbar wie product-images, neue Uploads landen dort nicht mehr.
+    match /images/{file=**} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // Alles andere verboten
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
